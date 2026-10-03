@@ -18,6 +18,9 @@ const model =
     : null;
 
 export const llmMode = model ? `openai (${env.openaiModel})` : 'mock (OPENAI_API_KEY 없음)';
+export const modelProvenance = model
+  ? { provider: 'openai', modelName: env.openaiModel! }
+  : { provider: 'mock', modelName: 'co-pen-mock-v1' };
 
 /**
  * L1 신뢰 채널 분리.

@@ -22,6 +22,7 @@ export interface AgentJob {
   promptHash: string;
   modelProvider: string | null;
   modelName: string | null;
+  sanitizedOutput: string | null;
   outputHash: string | null;
   createdAt: string;
   startedAt: string | null;
@@ -68,6 +69,15 @@ export interface TransitionAgentJobInput {
   outputHash?: string | null;
 }
 
+export interface CompleteAgentJobInput {
+  jobId: string;
+  documentName: string;
+  modelProvider: string;
+  modelName: string;
+  sanitizedOutput: string;
+  outputHash: string;
+}
+
 export interface AppendAuditEventInput {
   documentName: string;
   eventKey: string;
@@ -87,6 +97,7 @@ export interface JobAuditStore {
   listStaleActiveJobs(staleBefore: string, limit?: number): Promise<AgentJob[]>;
   listDocumentJobs(documentName: string, limit?: number): Promise<AgentJob[]>;
   transitionAgentJob(input: TransitionAgentJobInput): Promise<AgentJob>;
+  completeAgentJob(input: CompleteAgentJobInput): Promise<{ job: AgentJob; completed: boolean }>;
   appendAuditEvent(input: AppendAuditEventInput): Promise<AuditEvent>;
 }
 
@@ -149,6 +160,7 @@ function mapAgentJob(value: unknown): AgentJob {
     promptHash: stringValue(row, 'prompt_hash'),
     modelProvider: nullableString(row, 'model_provider'),
     modelName: nullableString(row, 'model_name'),
+    sanitizedOutput: nullableString(row, 'sanitized_output'),
     outputHash: nullableString(row, 'output_hash'),
     createdAt: stringValue(row, 'created_at'),
     startedAt: nullableString(row, 'started_at'),
@@ -336,6 +348,23 @@ export function createJobAuditStore(
       });
       throwDatabaseError(error);
       return mapAgentJob(data);
+    },
+
+    async completeAgentJob(input) {
+      const { data, error } = await source.rpc('complete_agent_job', {
+        p_job_id: input.jobId,
+        p_document_name: input.documentName,
+        p_model_provider: input.modelProvider,
+        p_model_name: input.modelName,
+        p_sanitized_output: input.sanitizedOutput,
+        p_output_hash: input.outputHash,
+      });
+      throwDatabaseError(error);
+      const result = record(data, 'complete_agent_job');
+      if (typeof result.completed !== 'boolean') {
+        throw new Error('invalid_complete_agent_job_response');
+      }
+      return { completed: result.completed, job: mapAgentJob(result.job) };
     },
 
     async appendAuditEvent(input) {

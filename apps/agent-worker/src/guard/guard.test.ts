@@ -2,7 +2,13 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { extractMentionPrompt, MAX_MENTION_LENGTH } from '@co-pen/shared';
 import type { BlockSummary } from '../doc-model';
-import { LINK_PLACEHOLDER, MAX_OUTPUT_CHARS, sanitizeText, StreamSanitizer } from './output-sanitizer';
+import {
+  LINK_PLACEHOLDER,
+  MAX_OUTPUT_CHARS,
+  OutputSanitizationError,
+  sanitizeText,
+  StreamSanitizer,
+} from './output-sanitizer';
 import { allowedTargets, verifyPlan } from './plan-guard';
 
 const blocks: BlockSummary[] = [
@@ -88,11 +94,12 @@ describe('L4 출력 정화', () => {
     assert.equal(out, `결과는  그리고 링크 텍스트 와 ${LINK_PLACEHOLDER} 입니다.`);
   });
 
-  it('출력 길이를 제한한다', () => {
+  it('출력 길이를 조용히 자르지 않고 거부한다', () => {
     const sanitizer = new StreamSanitizer();
-    let out = '';
-    for (let i = 0; i < 2000 && !sanitizer.exhausted; i++) out += sanitizer.push('가나다 ');
-    out += sanitizer.end();
-    assert.equal(out.length, MAX_OUTPUT_CHARS);
+    assert.throws(
+      () => sanitizer.push('가'.repeat(MAX_OUTPUT_CHARS + 1)),
+      (error: unknown) =>
+        error instanceof OutputSanitizationError && error.code === 'output_too_large',
+    );
   });
 });

@@ -5,7 +5,11 @@ import test from 'node:test';
 import { AGENT_SECRET_HEADER } from '@co-pen/shared';
 import type { ActorStore } from './actors';
 import { issueGuestToken } from './guest-token';
-import { createJobRequestHandler, parseWorkerTransition } from './job-http';
+import {
+  createJobRequestHandler,
+  parseWorkerCompletion,
+  parseWorkerTransition,
+} from './job-http';
 import type { AgentJob, JobAuditStore } from './job-audit-store';
 import { JobRuntimeError } from './job-runtime';
 import type { DocumentStore } from './persistence';
@@ -28,6 +32,7 @@ const JOB: AgentJob = {
   promptHash: 'a'.repeat(64),
   modelProvider: null,
   modelName: null,
+  sanitizedOutput: null,
   outputHash: null,
   createdAt: '2026-10-02T00:00:00.000Z',
   startedAt: '2026-10-02T00:00:01.000Z',
@@ -94,6 +99,12 @@ function dependencies(overrides: Partial<Parameters<typeof createJobRequestHandl
       async transitionFromWorker() {
         return { job: { ...JOB, status: 'writing' as const }, transitioned: true };
       },
+      async completeFromWorker() {
+        return {
+          job: { ...JOB, status: 'done' as const },
+          completed: true,
+        };
+      },
     },
     store,
     documentStore: documents(),
@@ -129,6 +140,39 @@ test('worker transition payload accepts only bounded legal CAS transitions', () 
       expectedStatus: 'planning',
       nextStatus: 'error',
       errorCode: 'INVALID CODE',
+    }),
+    null,
+  );
+});
+
+test('worker completion accepts bounded provenance and never accepts a worker hash', () => {
+  assert.ok(
+    parseWorkerCompletion({
+      jobId: JOB_ID,
+      documentName: DOCUMENT_NAME,
+      sanitizedOutput: 'safe output',
+      modelProvider: 'openai',
+      modelName: 'gpt-test',
+    }),
+  );
+  assert.equal(
+    parseWorkerCompletion({
+      jobId: JOB_ID,
+      documentName: DOCUMENT_NAME,
+      sanitizedOutput: 'x'.repeat(4001),
+      modelProvider: 'openai',
+      modelName: 'gpt-test',
+    }),
+    null,
+  );
+  assert.equal(
+    parseWorkerCompletion({
+      jobId: JOB_ID,
+      documentName: DOCUMENT_NAME,
+      sanitizedOutput: 'safe output',
+      modelProvider: 'openai',
+      modelName: 'gpt-test',
+      outputHash: 'a'.repeat(64),
     }),
     null,
   );
@@ -181,6 +225,9 @@ test('worker callback requires the shared secret and hides cross-document job ex
       if (input.documentName !== DOCUMENT_NAME) throw new JobRuntimeError('job_not_found', JOB_ID);
       return { job: { ...JOB, status: 'writing' as const }, transitioned: true };
     },
+    async completeFromWorker() {
+      return { job: { ...JOB, status: 'done' as const }, completed: true };
+    },
   };
   await withServer(dependencies({ runtime }), async (origin) => {
     const body = JSON.stringify({
@@ -216,5 +263,71 @@ test('worker callback requires the shared secret and hides cross-document job ex
       }),
     });
     assert.equal(mismatch.status, 404);
+  });
+});
+
+test('completion callback requires agent secret and maps idempotency conflicts', async () => {
+  let completions = 0;
+  const runtime = {
+    async transitionFromWorker() {
+      return { job: { ...JOB, status: 'writing' as const }, transitioned: true };
+    },
+    async completeFromWorker(input: { modelName: string }) {
+      completions += 1;
+      if (input.modelName === 'different') {
+        throw new JobRuntimeError('job_completion_conflict', JOB_ID);
+      }
+      return {
+        job: {
+          ...JOB,
+          status: 'done' as const,
+          modelProvider: 'openai',
+          modelName: input.modelName,
+          sanitizedOutput: 'safe output',
+          outputHash: 'a'.repeat(64),
+        },
+        completed: completions === 1,
+      };
+    },
+  };
+  const body = (modelName = 'gpt-test') =>
+    JSON.stringify({
+      jobId: JOB_ID,
+      documentName: DOCUMENT_NAME,
+      sanitizedOutput: 'safe output',
+      modelProvider: 'openai',
+      modelName,
+    });
+  await withServer(dependencies({ runtime }), async (origin) => {
+    const guestOnly = await fetch(`${origin}/internal/agent-jobs/complete`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer guest' },
+      body: body(),
+    });
+    assert.equal(guestOnly.status, 401);
+    assert.equal(completions, 0);
+
+    const first = await fetch(`${origin}/internal/agent-jobs/complete`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [AGENT_SECRET_HEADER]: AGENT_SECRET },
+      body: body(),
+    });
+    assert.equal(first.status, 200);
+    assert.deepEqual(await first.json(), { jobId: JOB_ID, status: 'done', completed: true });
+
+    const duplicate = await fetch(`${origin}/internal/agent-jobs/complete`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [AGENT_SECRET_HEADER]: AGENT_SECRET },
+      body: body(),
+    });
+    assert.equal(duplicate.status, 200);
+    assert.deepEqual(await duplicate.json(), { jobId: JOB_ID, status: 'done', completed: false });
+
+    const conflict = await fetch(`${origin}/internal/agent-jobs/complete`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [AGENT_SECRET_HEADER]: AGENT_SECRET },
+      body: body('different'),
+    });
+    assert.equal(conflict.status, 409);
   });
 });

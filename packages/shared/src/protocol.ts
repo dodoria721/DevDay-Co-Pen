@@ -74,7 +74,7 @@ export interface AgentJobRequest extends AgentRoomRequest {
 export interface AgentJobTransitionRequest extends AgentRoomRequest {
   jobId: string;
   expectedStatus: 'queued' | 'planning' | 'writing';
-  nextStatus: 'planning' | 'writing' | 'done' | 'error';
+  nextStatus: 'planning' | 'writing' | 'error';
   errorCode?: string;
   errorMessage?: string;
 }
@@ -83,6 +83,20 @@ export interface AgentJobTransitionResponse {
   jobId: string;
   status: AgentJobStatus;
   transitioned: boolean;
+}
+
+/** Agent Worker -> Sync Server completion provenance. The server computes outputHash. */
+export interface AgentJobCompletionRequest extends AgentRoomRequest {
+  jobId: string;
+  sanitizedOutput: string;
+  modelProvider: string;
+  modelName: string;
+}
+
+export interface AgentJobCompletionResponse {
+  jobId: string;
+  status: 'done';
+  completed: boolean;
 }
 
 /** POST /undo */

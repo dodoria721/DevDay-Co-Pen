@@ -23,6 +23,7 @@ const JOB_ROW = {
   prompt_hash: 'a'.repeat(64),
   model_provider: null,
   model_name: null,
+  sanitized_output: null,
   output_hash: null,
   created_at: '2026-10-02T00:00:00.000Z',
   started_at: null,
@@ -64,6 +65,24 @@ test('create, get, transition, and append wrappers map the database contract', a
             ...JOB_ROW,
             status: 'planning',
             started_at: '2026-10-02T00:00:01.000Z',
+          },
+          error: null,
+        };
+      }
+      if (name === 'complete_agent_job') {
+        return {
+          data: {
+            completed: true,
+            job: {
+              ...JOB_ROW,
+              status: 'done',
+              model_provider: 'openai',
+              model_name: 'gpt-test',
+              sanitized_output: 'safe output',
+              output_hash: 'c'.repeat(64),
+              started_at: '2026-10-02T00:00:01.000Z',
+              finished_at: '2026-10-02T00:00:02.000Z',
+            },
           },
           error: null,
         };
@@ -128,6 +147,17 @@ test('create, get, transition, and append wrappers map the database contract', a
   assert.equal(transitioned.status, 'planning');
   assert.ok(transitioned.startedAt);
 
+  const completed = await store.completeAgentJob({
+    jobId: JOB_ID,
+    documentName: DOCUMENT_NAME,
+    modelProvider: 'openai',
+    modelName: 'gpt-test',
+    sanitizedOutput: 'safe output',
+    outputHash: 'c'.repeat(64),
+  });
+  assert.equal(completed.completed, true);
+  assert.equal(completed.job.sanitizedOutput, 'safe output');
+
   const event = await store.appendAuditEvent({
     documentName: DOCUMENT_NAME,
     eventKey: 'event-1',
@@ -143,6 +173,7 @@ test('create, get, transition, and append wrappers map the database contract', a
   assert.deepEqual(calls.map((call) => call.name), [
     'create_agent_job',
     'transition_agent_job',
+    'complete_agent_job',
     'append_audit_event',
   ]);
 });

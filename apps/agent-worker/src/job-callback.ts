@@ -1,5 +1,7 @@
 import {
   AGENT_SECRET_HEADER,
+  type AgentJobCompletionRequest,
+  type AgentJobCompletionResponse,
   type AgentJobTransitionRequest,
   type AgentJobTransitionResponse,
 } from '@co-pen/shared';
@@ -28,6 +30,16 @@ function isTransitionResponse(value: unknown): value is AgentJobTransitionRespon
   );
 }
 
+function isCompletionResponse(value: unknown): value is AgentJobCompletionResponse {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as AgentJobCompletionResponse).jobId === 'string' &&
+    (value as AgentJobCompletionResponse).status === 'done' &&
+    typeof (value as AgentJobCompletionResponse).completed === 'boolean'
+  );
+}
+
 export async function requestJobTransition(
   request: AgentJobTransitionRequest,
 ): Promise<AgentJobTransitionResponse> {
@@ -44,6 +56,26 @@ export async function requestJobTransition(
   const body: unknown = await response.json();
   if (!isTransitionResponse(body) || body.jobId !== request.jobId) {
     throw new Error('invalid_job_status_callback_response');
+  }
+  return body;
+}
+
+export async function requestJobCompletion(
+  request: AgentJobCompletionRequest,
+): Promise<AgentJobCompletionResponse> {
+  const response = await fetch(syncHttpUrl('/internal/agent-jobs/complete'), {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      [AGENT_SECRET_HEADER]: env.agentSharedSecret,
+    },
+    body: JSON.stringify(request),
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!response.ok) throw new Error('job_completion_callback_failed');
+  const body: unknown = await response.json();
+  if (!isCompletionResponse(body) || body.jobId !== request.jobId) {
+    throw new Error('invalid_job_completion_callback_response');
   }
   return body;
 }

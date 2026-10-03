@@ -8,6 +8,12 @@
 export const MAX_OUTPUT_CHARS = 4000;
 export const LINK_PLACEHOLDER = '[링크 삭제됨]';
 
+export class OutputSanitizationError extends Error {
+  constructor(readonly code: 'output_too_large' | 'output_sanitization_failed') {
+    super(code);
+  }
+}
+
 /** 스트림에서 판단을 미룰 수 있는 최대 길이. 넘으면 닫히지 않은 구문이 있어도 정화해서 내보낸다. */
 const MAX_HOLD_CHARS = 300;
 
@@ -44,13 +50,8 @@ export class StreamSanitizer {
   private pending = '';
   private emitted = 0;
 
-  /** 길이 제한에 걸려 더 이상 내보내지 않는 상태 */
-  get exhausted(): boolean {
-    return this.emitted >= MAX_OUTPUT_CHARS;
-  }
-
   push(chunk: string): string {
-    if (this.exhausted) return '';
+    if (typeof chunk !== 'string') throw new OutputSanitizationError('output_sanitization_failed');
     this.pending += chunk;
 
     const cut = this.pending.length > MAX_HOLD_CHARS ? this.pending.length : safeCut(this.pending);
@@ -63,14 +64,15 @@ export class StreamSanitizer {
   end(): string {
     const rest = this.pending;
     this.pending = '';
-    return this.exhausted ? '' : this.limit(sanitizeText(rest));
+    return this.limit(sanitizeText(rest));
   }
 
   private limit(text: string): string {
-    const room = MAX_OUTPUT_CHARS - this.emitted;
-    const out = text.slice(0, room);
-    this.emitted += out.length;
-    return out;
+    if (this.emitted + text.length > MAX_OUTPUT_CHARS) {
+      throw new OutputSanitizationError('output_too_large');
+    }
+    this.emitted += text.length;
+    return text;
   }
 }
 

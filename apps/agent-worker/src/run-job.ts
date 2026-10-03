@@ -2,6 +2,8 @@ import * as Y from 'yjs';
 import {
   AGENT_ORIGIN,
   extractMentionPrompt,
+  type AgentJobCompletionRequest,
+  type AgentJobCompletionResponse,
   type AgentJobRequest,
   type AgentJobTransitionRequest,
   type AgentJobTransitionResponse,
@@ -15,9 +17,9 @@ import {
   summarizeBlocks,
 } from './doc-model';
 import { env } from './env';
-import { StreamSanitizer } from './guard/output-sanitizer';
-import { requestJobTransition } from './job-callback';
-import { planEdit, streamDraft } from './llm';
+import { OutputSanitizationError, StreamSanitizer } from './guard/output-sanitizer';
+import { requestJobCompletion, requestJobTransition } from './job-callback';
+import { modelProvenance, planEdit, streamDraft } from './llm';
 import type { AgentSession } from './session';
 import { StreamWriter } from './stream-writer';
 
@@ -25,14 +27,20 @@ const SYNC_WAIT_TIMEOUT_MS = 3000;
 
 export interface RunJobDependencies {
   transition(request: AgentJobTransitionRequest): Promise<AgentJobTransitionResponse>;
+  complete(request: AgentJobCompletionRequest): Promise<AgentJobCompletionResponse>;
   plan: typeof planEdit;
   stream: typeof streamDraft;
+  modelProvider: string;
+  modelName: string;
 }
 
 const DEFAULT_DEPENDENCIES: RunJobDependencies = {
   transition: requestJobTransition,
+  complete: requestJobCompletion,
   plan: planEdit,
   stream: streamDraft,
+  modelProvider: modelProvenance.provider,
+  modelName: modelProvenance.modelName,
 };
 
 function hasSeen(doc: Y.Doc, required: Map<number, number>): boolean {
@@ -80,15 +88,24 @@ async function reportFailure(
   dependencies: RunJobDependencies,
   job: AgentJobRequest,
   expectedStatus: 'planning' | 'writing',
+  error: unknown,
 ): Promise<void> {
+  const errorCode =
+    error instanceof OutputSanitizationError ? error.code : 'worker_execution_failed';
+  const errorMessage =
+    errorCode === 'output_too_large'
+      ? 'AI 출력이 허용된 길이를 초과했습니다.'
+      : errorCode === 'output_sanitization_failed'
+        ? 'AI 출력을 안전하게 정화하지 못했습니다.'
+        : 'AI 작업 실행에 실패했습니다.';
   try {
     await dependencies.transition({
       jobId: job.jobId,
       documentName: job.documentName,
       expectedStatus,
       nextStatus: 'error',
-      errorCode: 'worker_execution_failed',
-      errorMessage: 'AI 작업 실행에 실패했습니다.',
+      errorCode,
+      errorMessage,
     });
   } catch {
     // The Sync Server recovery path will terminalize a stale active job.
@@ -123,12 +140,23 @@ export async function runJob(
     if (!(await transition(dependencies, job, 'planning', 'writing'))) return;
     ownedStatus = 'writing';
 
+    const sanitizer = new StreamSanitizer();
+    let sanitizedOutput = '';
+    for await (const chunk of dependencies.stream({
+      prompt,
+      targetIndex: plan.targetIndex,
+      blocks,
+    })) {
+      sanitizedOutput += sanitizer.push(chunk);
+    }
+    sanitizedOutput += sanitizer.end();
+    if (!sanitizedOutput) throw new OutputSanitizationError('output_sanitization_failed');
+
     session.undoManager.stopCapturing();
     let target!: Y.XmlText;
     doc.transact(() => {
       target = insertParagraph(fragment, resolveBlockIndex(doc, anchors[plan.targetIndex]));
     }, AGENT_ORIGIN);
-
     const writer = new StreamWriter(
       doc,
       fragment,
@@ -137,23 +165,18 @@ export async function runJob(
       env.flushIntervalMs,
       job.jobId,
     );
-    const sanitizer = new StreamSanitizer();
-    try {
-      for await (const chunk of dependencies.stream({
-        prompt,
-        targetIndex: plan.targetIndex,
-        blocks,
-      })) {
-        writer.push(sanitizer.push(chunk));
-        if (sanitizer.exhausted) break;
-      }
-      writer.push(sanitizer.end());
-    } finally {
-      writer.close();
-    }
-    await transition(dependencies, job, 'writing', 'done');
+    writer.push(sanitizedOutput);
+    writer.close();
+
+    await dependencies.complete({
+      jobId: job.jobId,
+      documentName: job.documentName,
+      sanitizedOutput,
+      modelProvider: dependencies.modelProvider,
+      modelName: dependencies.modelName,
+    });
   } catch (error) {
-    await reportFailure(dependencies, job, ownedStatus);
+    await reportFailure(dependencies, job, ownedStatus, error);
     throw error;
   }
 }

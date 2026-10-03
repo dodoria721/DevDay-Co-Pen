@@ -4,6 +4,7 @@ import {
   AGENT_USER,
   DOC_FIELD,
   extractMentionPrompt,
+  type AgentJobCompletionRequest,
   type AgentJobRequest,
   type AgentJobStatus,
   type AgentJobTransitionRequest,
@@ -22,7 +23,9 @@ const UUID_V4_PATTERN =
 const BASE64_PATTERN = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const MAX_STATE_VECTOR_BYTES = 16 * 1024;
 const MAX_ACTOR_NAME_LENGTH = 200;
+export const MAX_SANITIZED_OUTPUT_CHARS = 4000;
 const RECOVERY_BATCH_SIZE = 100;
+const MODEL_PROVIDER_PATTERN = /^[a-z0-9][a-z0-9_.:-]*$/;
 
 export class JobRuntimeError extends Error {
   constructor(
@@ -30,6 +33,9 @@ export class JobRuntimeError extends Error {
       | 'invalid_agent_request'
       | 'idempotency_conflict'
       | 'job_acceptance_failed'
+      | 'invalid_agent_completion'
+      | 'job_completion_conflict'
+      | 'job_completion_failed'
       | 'job_not_found'
       | 'job_transition_failed',
     readonly jobId = 'request',
@@ -64,6 +70,11 @@ export interface AcceptMentionResult {
 export interface TransitionResult {
   job: AgentJob;
   transitioned: boolean;
+}
+
+export interface CompletionResult {
+  job: AgentJob;
+  completed: boolean;
 }
 
 export interface RecoveryResult {
@@ -335,6 +346,54 @@ export class DurableJobRuntime {
 
     this.dependencies.broadcast(transitioned.documentName, jobStatusMessage(transitioned));
     return { job: transitioned, transitioned: true };
+  }
+
+  async completeFromWorker(input: AgentJobCompletionRequest): Promise<CompletionResult> {
+    if (
+      typeof input.sanitizedOutput !== 'string' ||
+      input.sanitizedOutput.length < 1 ||
+      input.sanitizedOutput.length > MAX_SANITIZED_OUTPUT_CHARS ||
+      typeof input.modelProvider !== 'string' ||
+      input.modelProvider.length < 1 ||
+      input.modelProvider.length > 100 ||
+      !MODEL_PROVIDER_PATTERN.test(input.modelProvider) ||
+      typeof input.modelName !== 'string' ||
+      input.modelName.length < 1 ||
+      input.modelName.length > 200 ||
+      input.modelName.trim() !== input.modelName
+    ) {
+      throw new JobRuntimeError('invalid_agent_completion', input.jobId);
+    }
+
+    let result: CompletionResult;
+    try {
+      result = await this.dependencies.store.completeAgentJob({
+        jobId: input.jobId,
+        documentName: input.documentName,
+        modelProvider: input.modelProvider,
+        modelName: input.modelName,
+        sanitizedOutput: input.sanitizedOutput,
+        outputHash: sha256(input.sanitizedOutput),
+      });
+    } catch (error) {
+      if (error instanceof JobAuditDatabaseError) {
+        if (error.code === 'P0002') {
+          throw new JobRuntimeError('job_not_found', input.jobId);
+        }
+        if (error.code === '23505' || error.code === 'P0001') {
+          throw new JobRuntimeError('job_completion_conflict', input.jobId);
+        }
+        if (error.code === '22023' || error.code === '23514') {
+          throw new JobRuntimeError('invalid_agent_completion', input.jobId);
+        }
+      }
+      throw new JobRuntimeError('job_completion_failed', input.jobId);
+    }
+
+    if (result.completed) {
+      this.dependencies.broadcast(result.job.documentName, jobStatusMessage(result.job));
+    }
+    return result;
   }
 
   async recoverOnStartup(staleAfterMs: number): Promise<RecoveryResult> {

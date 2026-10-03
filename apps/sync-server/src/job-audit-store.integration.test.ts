@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import test from 'node:test';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import * as Y from 'yjs';
@@ -22,6 +22,8 @@ import { createDocumentStore } from './persistence';
 const enabled = process.env.RUN_DB_INTEGRATION_TESTS === '1';
 const SHA_A = 'a'.repeat(64);
 const SHA_B = 'b'.repeat(64);
+const SANITIZED_OUTPUT = '통합 테스트 최종 출력';
+const OUTPUT_HASH = createHash('sha256').update(SANITIZED_OUTPUT, 'utf8').digest('hex');
 
 interface Fixture {
   documentName: string;
@@ -89,8 +91,6 @@ function jobInput(fixtureValue: Fixture, overrides: Partial<CreateAgentJobInput>
     operationType: 'insert_after',
     idempotencyKey: randomUUID(),
     promptHash: SHA_A,
-    modelProvider: 'openai',
-    modelName: 'integration-test-model',
     ...overrides,
   };
 }
@@ -190,20 +190,45 @@ test('Local Supabase job/audit foundation', { skip: !enabled }, async (context) 
     });
     assert.equal(writing.status, 'writing');
     assert.equal(writing.finishedAt, null);
-    const done = await store.transitionAgentJob({
+    const done = await store.completeAgentJob({
       jobId: happy.jobId,
-      expectedStatus: 'writing',
-      nextStatus: 'done',
-      outputHash: SHA_B,
+      documentName: fixtureValue.documentName,
+      modelProvider: 'openai',
+      modelName: 'integration-test-model',
+      sanitizedOutput: SANITIZED_OUTPUT,
+      outputHash: OUTPUT_HASH,
     });
-    assert.equal(done.status, 'done');
-    assert.equal(done.outputHash, SHA_B);
-    assert.ok(done.finishedAt);
-    assert.ok(new Date(done.finishedAt!).getTime() >= new Date(done.startedAt!).getTime());
+    assert.equal(done.completed, true);
+    assert.equal(done.job.status, 'done');
+    assert.equal(done.job.sanitizedOutput, SANITIZED_OUTPUT);
+    assert.equal(done.job.outputHash, OUTPUT_HASH);
+    assert.ok(done.job.finishedAt);
+    assert.ok(new Date(done.job.finishedAt!).getTime() >= new Date(done.job.startedAt!).getTime());
+    const duplicateDone = await store.completeAgentJob({
+      jobId: happy.jobId,
+      documentName: fixtureValue.documentName,
+      modelProvider: 'openai',
+      modelName: 'integration-test-model',
+      sanitizedOutput: SANITIZED_OUTPUT,
+      outputHash: OUTPUT_HASH,
+    });
+    assert.equal(duplicateDone.completed, false);
+    await expectDatabaseCode(
+      () =>
+        store.completeAgentJob({
+          jobId: happy.jobId,
+          documentName: fixtureValue.documentName,
+          modelProvider: 'openai',
+          modelName: 'different-model',
+          sanitizedOutput: SANITIZED_OUTPUT,
+          outputHash: OUTPUT_HASH,
+        }),
+      '23505',
+    );
     await expectDatabaseCode(
       () =>
         store.transitionAgentJob({
-          jobId: done.jobId,
+          jobId: done.job.jobId,
           expectedStatus: 'done',
           nextStatus: 'error',
         }),
@@ -212,7 +237,7 @@ test('Local Supabase job/audit foundation', { skip: !enabled }, async (context) 
     await expectDatabaseCode(
       () =>
         store.transitionAgentJob({
-          jobId: done.jobId,
+          jobId: done.job.jobId,
           expectedStatus: 'done',
           nextStatus: 'writing',
         }),
@@ -281,6 +306,30 @@ test('Local Supabase job/audit foundation', { skip: !enabled }, async (context) 
           jobId: planningToDone.jobId,
           expectedStatus: 'planning',
           nextStatus: 'done',
+        }),
+      '22023',
+    );
+
+    const hashMismatch = await createJob(store, fixtureValue);
+    await store.transitionAgentJob({
+      jobId: hashMismatch.jobId,
+      expectedStatus: 'queued',
+      nextStatus: 'planning',
+    });
+    await store.transitionAgentJob({
+      jobId: hashMismatch.jobId,
+      expectedStatus: 'planning',
+      nextStatus: 'writing',
+    });
+    await expectDatabaseCode(
+      () =>
+        store.completeAgentJob({
+          jobId: hashMismatch.jobId,
+          documentName: fixtureValue.documentName,
+          modelProvider: 'openai',
+          modelName: 'integration-test-model',
+          sanitizedOutput: SANITIZED_OUTPUT,
+          outputHash: SHA_B,
         }),
       '22023',
     );
@@ -570,16 +619,25 @@ test('Local Supabase job/audit foundation', { skip: !enabled }, async (context) 
       expectedStatus: 'planning',
       nextStatus: 'writing',
     });
-    await runtime.transitionFromWorker({
+    const completionInput = {
       jobId: accepted.job.jobId,
       documentName: fixtureValue.documentName,
-      expectedStatus: 'writing',
-      nextStatus: 'done',
-    });
+      sanitizedOutput: SANITIZED_OUTPUT,
+      modelProvider: 'openai',
+      modelName: 'integration-test-model',
+    };
+    const completion = await runtime.completeFromWorker(completionInput);
+    const duplicateCompletion = await runtime.completeFromWorker(completionInput);
+    assert.equal(completion.completed, true);
+    assert.equal(duplicateCompletion.completed, false);
     assert.deepEqual(broadcastStatuses, ['queued', 'planning', 'writing', 'done']);
 
     const documentJobs = await store.listDocumentJobs(fixtureValue.documentName);
     assert.equal(documentJobs[0]?.status, 'done');
+    assert.equal(documentJobs[0]?.sanitizedOutput, SANITIZED_OUTPUT);
+    assert.equal(documentJobs[0]?.outputHash, OUTPUT_HASH);
+    assert.equal(documentJobs[0]?.modelProvider, 'openai');
+    assert.equal(documentJobs[0]?.modelName, 'integration-test-model');
     const { data: events, error } = await client
       .from('audit_events')
       .select('event_type, metadata')
@@ -589,8 +647,16 @@ test('Local Supabase job/audit foundation', { skip: !enabled }, async (context) 
     assert.deepEqual(events?.map((event) => event.event_type), [
       'ai_job_requested',
       'ai_job_started',
+      'ai_output_completed',
     ]);
+    assert.deepEqual(events?.at(-1)?.metadata, {
+      modelName: 'integration-test-model',
+      modelProvider: 'openai',
+      operationType: 'insert_after',
+      outputHash: OUTPUT_HASH,
+    });
     assert.equal(JSON.stringify(events).includes('통합 테스트 결론'), false);
+    assert.equal(JSON.stringify(events).includes(SANITIZED_OUTPUT), false);
   });
 
   await context.test('stale guest identity is reissued before durable job creation', async () => {

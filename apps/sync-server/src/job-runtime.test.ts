@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import * as Y from 'yjs';
 import { DOC_FIELD, type AgentJobStatus } from '@co-pen/shared';
@@ -8,6 +9,7 @@ import {
   type AppendAuditEventInput,
   type AuditEvent,
   type CreateAgentJobInput,
+  type CompleteAgentJobInput,
   type JobAuditStore,
   type TransitionAgentJobInput,
 } from './job-audit-store';
@@ -24,6 +26,7 @@ function jobFrom(input: CreateAgentJobInput): AgentJob {
     status: 'queued',
     modelProvider: input.modelProvider ?? null,
     modelName: input.modelName ?? null,
+    sanitizedOutput: null,
     outputHash: null,
     createdAt: '2026-10-02T00:00:00.000Z',
     startedAt: null,
@@ -125,6 +128,50 @@ class MemoryJobAuditStore implements JobAuditStore {
     };
     this.jobs.set(next.jobId, next);
     return next;
+  }
+
+  async completeAgentJob(input: CompleteAgentJobInput) {
+    const current = this.jobs.get(input.jobId);
+    if (!current || current.documentName !== input.documentName) {
+      throw new JobAuditDatabaseError({ code: 'P0002' });
+    }
+    if (current.status === 'done') {
+      if (
+        current.modelProvider !== input.modelProvider ||
+        current.modelName !== input.modelName ||
+        current.sanitizedOutput !== input.sanitizedOutput ||
+        current.outputHash !== input.outputHash
+      ) {
+        throw new JobAuditDatabaseError({ code: '23505' });
+      }
+      return { job: current, completed: false };
+    }
+    if (current.status !== 'writing') throw new JobAuditDatabaseError({ code: 'P0001' });
+    const job: AgentJob = {
+      ...current,
+      status: 'done',
+      modelProvider: input.modelProvider,
+      modelName: input.modelName,
+      sanitizedOutput: input.sanitizedOutput,
+      outputHash: input.outputHash,
+      finishedAt: '2026-10-02T00:02:00.000Z',
+    };
+    this.jobs.set(job.jobId, job);
+    await this.appendAuditEvent({
+      documentName: job.documentName,
+      eventKey: `job:${job.jobId}:completed`,
+      eventType: 'ai_output_completed',
+      actorId: job.agentActorId,
+      actorNameSnapshot: 'Co-Pen AI',
+      jobId: job.jobId,
+      metadata: {
+        operationType: job.operationType,
+        outputHash: job.outputHash,
+        modelProvider: job.modelProvider,
+        modelName: job.modelName,
+      },
+    });
+    return { job, completed: true };
   }
 
   async appendAuditEvent(input: AppendAuditEventInput) {
@@ -291,6 +338,61 @@ test('planning CAS allows one worker claim and rejects duplicate dispatch', asyn
   assert.equal(
     [...store.audits.values()].filter((event) => event.eventType === 'ai_job_started').length,
     1,
+  );
+});
+
+test('completion hashes sanitized output and appends one minimal provenance event', async () => {
+  const store = new MemoryJobAuditStore();
+  const runtime = new DurableJobRuntime({
+    store,
+    documentStore: documentStore(),
+    dispatchJob: async () => undefined,
+    broadcast() {},
+  });
+  const accepted = await runtime.acceptMention(mention());
+  await runtime.transitionFromWorker({
+    jobId: accepted.job.jobId,
+    documentName: DOCUMENT_NAME,
+    expectedStatus: 'queued',
+    nextStatus: 'planning',
+  });
+  await runtime.transitionFromWorker({
+    jobId: accepted.job.jobId,
+    documentName: DOCUMENT_NAME,
+    expectedStatus: 'planning',
+    nextStatus: 'writing',
+  });
+  const input = {
+    jobId: accepted.job.jobId,
+    documentName: DOCUMENT_NAME,
+    sanitizedOutput: '최종 정화 결과',
+    modelProvider: 'openai',
+    modelName: 'gpt-test',
+  };
+  const first = await runtime.completeFromWorker(input);
+  const repeated = await runtime.completeFromWorker(input);
+  assert.equal(first.completed, true);
+  assert.equal(repeated.completed, false);
+  assert.equal(first.job.sanitizedOutput, input.sanitizedOutput);
+  assert.equal(
+    first.job.outputHash,
+    createHash('sha256').update(input.sanitizedOutput, 'utf8').digest('hex'),
+  );
+  const completed = [...store.audits.values()].filter(
+    (event) => event.eventType === 'ai_output_completed',
+  );
+  assert.equal(completed.length, 1);
+  assert.deepEqual(Object.keys(completed[0]!.metadata).sort(), [
+    'modelName',
+    'modelProvider',
+    'operationType',
+    'outputHash',
+  ]);
+  assert.equal(JSON.stringify(completed[0]!.metadata).includes(input.sanitizedOutput), false);
+  await assert.rejects(
+    () => runtime.completeFromWorker({ ...input, modelName: 'different-model' }),
+    (error: unknown) =>
+      error instanceof JobRuntimeError && error.code === 'job_completion_conflict',
   );
 });
 
